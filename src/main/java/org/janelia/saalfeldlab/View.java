@@ -119,33 +119,17 @@
  */
 package org.janelia.saalfeldlab;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.concurrent.Callable;
-
-import javax.swing.JFrame;
-import javax.swing.SwingUtilities;
-import javax.swing.WindowConstants;
-
-import org.janelia.saalfeldlab.N5Factory.N5Options;
-import org.janelia.saalfeldlab.n5.N5FSReader;
-import org.janelia.saalfeldlab.n5.N5Reader;
-import org.janelia.saalfeldlab.n5.N5Reader.Version;
-import org.janelia.saalfeldlab.n5.imglib2.N5Utils;
-
 import bdv.util.AxisOrder;
 import bdv.util.Bdv;
 import bdv.util.BdvFunctions;
+import bdv.util.BdvHandle;
 import bdv.util.BdvOptions;
 import bdv.util.BdvStackSource;
 import bdv.util.RandomAccessibleIntervalMipmapSource;
 import bdv.util.volatiles.SharedQueue;
 import bdv.util.volatiles.VolatileViews;
+import bdv.viewer.ViewerPanel;
+import bdv.viewer.animate.SimilarityTransformAnimator;
 import mpicbg.spim.data.sequence.FinalVoxelDimensions;
 import net.imglib2.RandomAccessible;
 import net.imglib2.RandomAccessibleInterval;
@@ -164,8 +148,23 @@ import net.imglib2.util.ValuePair;
 import net.imglib2.view.IntervalView;
 import net.imglib2.view.MixedTransformView;
 import net.imglib2.view.Views;
+import org.janelia.saalfeldlab.N5Factory.N5Options;
+import org.janelia.saalfeldlab.n5.N5FSReader;
+import org.janelia.saalfeldlab.n5.N5Reader;
+import org.janelia.saalfeldlab.n5.N5Reader.Version;
+import org.janelia.saalfeldlab.n5.imglib2.N5Utils;
 import picocli.CommandLine;
 import picocli.CommandLine.Option;
+
+import javax.swing.*;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
 
 /**
  *
@@ -224,9 +223,52 @@ public class View implements Callable<Void> {
 	@Option(names = {"-s", "--scales"}, split = ",", description = "comma separated list of screen scales, e.g. -s 1.0,0.5,0.25 (default 1.0,0.75,0.5,0.25,0.125)")
 	private double[] screenScales = new double[] {1.0, 0.5, 0.25, 0.125};
 
+	@Option(names = {"--location"},
+			description = "A space separated list of values that specify the initial view location.  " +
+						  "A 3 value list specifies full scale x,y,z and view scale is assumed to be 1.0 (e.g. --location 1600 1400 3080).  " +
+						  "A 4 value list specifies full scale x,y,z and view scale is the fourth value (e.g. --location 1600 1400 3080 0.1).  " +
+						  "A 12 value list specifies explicit bookmark 3D affine parameters (e.g. --location 0.1 0 0 -160 0 0.1 0 -140 0 0 0.1 -308).",
+			arity="3..12")
+	private List<Double> location = null;
+
 	private int maxN = 2;
 
 	private final ArrayList<ReaderInfo> readerInfos = new ArrayList<>();
+
+	private AffineTransform3D getStartLocation() {
+
+		final AffineTransform3D t = new AffineTransform3D();
+
+		if (location != null) {
+
+			double[] affineValues = new double[12];
+
+			if (location.size() == 12) {
+
+				affineValues = location.stream().mapToDouble(Double::doubleValue).toArray(); // explicit bookmark
+
+			} else if (location.size() < 5) {
+
+				final double scale = (location.size() == 4) ? location.get(3) : 1.0;
+				final double tz = (location.size() > 2) ? location.get(2) : 0.0;
+				final double ty = (location.size() > 1) ? location.get(1) : 0.0;
+				final double tx = (location.size() > 0) ? location.get(0) : 0.0;
+				affineValues[0] = scale;
+				affineValues[3] = -1.0 * scale * tx;
+				affineValues[5] = scale;
+				affineValues[7] = -1.0 * scale * ty;
+				affineValues[10] = scale;
+				affineValues[11] = -1.0 * scale * tz;
+
+			} else {
+				throw new IllegalArgumentException("location parameter must specify 12 or less than 5 values");
+			}
+
+			t.set(affineValues);
+		}
+
+		return t;
+	}
 
 	private static final boolean parseCSDoubleArray(final String csv, final double[] array) {
 
@@ -462,6 +504,26 @@ public class View implements Callable<Void> {
 				bdv.setColor(new ARGBType(argb(id++)));
 			}
 
+			final BdvHandle bdvHandle = bdv != null ? bdv.getBdvHandle() : null;
+
+			if ((bdvHandle != null) && (location != null)) {
+
+				final ViewerPanel viewer = bdvHandle.getViewerPanel();
+				final AffineTransform3D startLocation = getStartLocation();
+
+				final AffineTransform3D viewerCenter = new AffineTransform3D();
+				viewer.state().getViewerTransform(viewerCenter);
+				final double cX = viewer.getDisplay().getWidth() / 2.0;
+				final double cY = viewer.getDisplay().getHeight() / 2.0;
+				viewerCenter.set(viewerCenter.get(0, 3) - cX, 0, 3);
+				viewerCenter.set(viewerCenter.get(1, 3) - cY, 1, 3);
+
+				viewer.setTransformAnimator(
+						new SimilarityTransformAnimator(viewerCenter, startLocation, cX, cY, 300));
+				viewer.toggleInterpolation();
+
+			}
+
 			if (id == 1)
 				bdv.setColor(new ARGBType(0xffffffff));
 		}
@@ -511,7 +573,14 @@ public class View implements Callable<Void> {
 
 	public static final void main(final String... args) {
 
-		new CommandLine(new View()).execute(singlePathToArgs(args));
+		final String[] effectiveArgs = args.length > 0 ? args : getHardcodedArgs();
+		new CommandLine(new View()).execute(singlePathToArgs(effectiveArgs));
+	}
+
+	public static String[] getHardcodedArgs() {
+		final String a = "-i /nrs/flyem/render/n5/Z0720_07m_BR -d /render/Sec37/v1_acquire_trimmed_sp1___20210311_112531 -o -907,-1064,1" +
+						 " --location 0.0 0.0 1.4406990839672948 -7063.528541082594 0.0 1.4406990839672948 0.0 -467.09886426300585 -1.4406990839672948 0.0 0.0 14313.816773726527";
+		return a.split(" ");
 	}
 
 	// hash code from https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
